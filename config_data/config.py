@@ -18,8 +18,6 @@ class Args:
 
 
 def load_config(path: str | None = None) -> Args:
-    env = Env()
-    env.read_env(path)
 
     return Args(image_size = (60,90),
                 pred_len = 12,
@@ -27,5 +25,6 @@ def load_config(path: str | None = None) -> Args:
                 patch_size = 5,
                 memory = 16,
                 emb_size = 16*5**2,
+                #emb_size = 5**2,
                 gpu = device('cuda:0' if cuda.is_available() else 'cpu')
                 )
