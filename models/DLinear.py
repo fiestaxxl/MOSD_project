@@ -35,53 +35,87 @@ class series_decomp(nn.Module):
         res = x - moving_mean
         return res, moving_mean
 
-class Model(nn.Module):
+class DLinear(nn.Module):
     """
     Decomposition-Linear
     """
-    def __init__(self, configs):
-        super(Model, self).__init__()
-        self.seq_len = configs.seq_len
-        self.pred_len = configs.pred_len
+    def __init__(self, **kwargs):
+        super(DLinear, self).__init__()
+        for k, v in kwargs.items():
+            self.__setattr__(k, v)
 
-        # Decompsition Kernel Size
+        self.T_in, self.H, self.W, self.C_in = self.input_shape
+        self.T_out, self.H, self.W, self.C_out = self.target_shape
+
+        self.padding_H = self.H % self.kernel_size
+        self.padding_W = self.W % self.kernel_size
+
+        self.unfold = nn.Unfold(kernel_size=[self.kernel_size] * 2,
+                                padding=(self.padding_H, self.padding_W),
+                                stride=(self.kernel_size // 2, self.kernel_size // 2))
+        self.fold = nn.Fold(output_size=(self.H, self.W),
+                            kernel_size=[self.kernel_size] * 2,
+                            padding=(self.padding_H, self.padding_W),
+                            stride=(self.kernel_size // 2, self.kernel_size // 2))
+
+        self.w_s= {}
+        for _ in range(self.C_out * self.T_out):
+            self.w_s.update({
+                f"w_{_}": nn.Parameter(torch.randn(self.T_in, self.C_in, self.kernel_size, self.kernel_size),
+                                    requires_grad=True),
+                f"bias_{_}": nn.Parameter(torch.zeros((self.kernel_size, self.kernel_size)),
+                                    requires_grad=True),
+            })
+
+        self.w_s = nn.ParameterDict(self.w_s)
+
+        self.w_t= {}
+        for _ in range(self.C_out * self.T_out):
+            self.w_t.update({
+                f"w_{_}": nn.Parameter(torch.randn(self.T_in, self.C_in, self.kernel_size, self.kernel_size),
+                                    requires_grad=True),
+                f"bias_{_}": nn.Parameter(torch.zeros((self.kernel_size, self.kernel_size)),
+                                    requires_grad=True),
+            })
+
+        self.w_t = nn.ParameterDict(self.w_t)
+
+
         kernel_size = 25
         self.decompsition = series_decomp(kernel_size)
-        self.individual = configs.individual
-        self.channels = configs.enc_in
-
-        if self.individual:
-            self.Linear_Seasonal = nn.ModuleList()
-            self.Linear_Trend = nn.ModuleList()
-            
-            for i in range(self.channels):
-                self.Linear_Seasonal.append(nn.Linear(self.seq_len,self.pred_len))
-                self.Linear_Trend.append(nn.Linear(self.seq_len,self.pred_len))
-
-                # Use this two lines if you want to visualize the weights
-                # self.Linear_Seasonal[i].weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
-                # self.Linear_Trend[i].weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
-        else:
-            self.Linear_Seasonal = nn.Linear(self.seq_len,self.pred_len)
-            self.Linear_Trend = nn.Linear(self.seq_len,self.pred_len)
-            
-            # Use this two lines if you want to visualize the weights
-            # self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
-            # self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
 
     def forward(self, x):
-        # x: [Batch, Input length, Channel]
-        seasonal_init, trend_init = self.decompsition(x)
-        seasonal_init, trend_init = seasonal_init.permute(0,2,1), trend_init.permute(0,2,1)
-        if self.individual:
-            seasonal_output = torch.zeros([seasonal_init.size(0),seasonal_init.size(1),self.pred_len],dtype=seasonal_init.dtype).to(seasonal_init.device)
-            trend_output = torch.zeros([trend_init.size(0),trend_init.size(1),self.pred_len],dtype=trend_init.dtype).to(trend_init.device)
-            for i in range(self.channels):
-                seasonal_output[:,i,:] = self.Linear_Seasonal[i](seasonal_init[:,i,:])
-                trend_output[:,i,:] = self.Linear_Trend[i](trend_init[:,i,:])
-        else:
-            seasonal_output = self.Linear_Seasonal(seasonal_init)
-            trend_output = self.Linear_Trend(trend_init)
+        B, T_in, H, W, C_in = x.shape
+        x = x.permute(0, 1, 4, 2, 3)
+        x = x.reshape(B, -1, H, W)
+        x = self.unfold(x) # [B, ..., L]
 
-        x = seasonal_output + trend_output
-        return x.permute(0,2,1) # to [Batch, Output length, Channel]
+        seasonal_init, trend_init = self.decompsition(x)
+        #seasonal_init, trend_init = seasonal_init.permute(0,2,1), trend_init.permute(0,2,1)
+
+        L = x.shape[-1]
+        #x = x.reshape(B, T_in, C_in, self.kernel_size, self.kernel_size, L).permute(0, 5, 1, 2, 3, 4) # [B, L, T_in, C_in, k, k]
+        seasonal_init = seasonal_init.reshape(B, T_in, C_in, self.kernel_size, self.kernel_size, L).permute(0, 5, 1, 2, 3, 4) # [B, L, T_in, C_in, k, k]
+        trend_init = trend_init.reshape(B, T_in, C_in, self.kernel_size, self.kernel_size, L).permute(0, 5, 1, 2, 3, 4) # [B, L, T_in, C_in, k, k]
+
+        xx = []
+        yy = []
+        for i in range(self.C_out * self.T_out):
+            w_s, bias_s = self.w_s[f"w_{i}"], self.w_s[f"bias_{i}"]
+            xx.append((seasonal_init * w_s).sum(dim=(2, 3)) + bias_s)  # [B, L, k, k]
+
+            w_t, bias_t = self.w_t[f"w_{i}"], self.w_t[f"bias_{i}"]
+            yy.append((trend_init * w_t).sum(dim=(2, 3)) + bias_t)  # [B, L, k, k]
+
+
+
+        seasonal_init = torch.stack(xx, dim=1) # [B, C_out * T_out, L, k, k]
+        seasonal_init = seasonal_init.permute(0, 1, 3, 4, 2).reshape(B, -1, L)
+        trend_init = torch.stack(xx, dim=1) # [B, C_out * T_out, L, k, k]
+        trend_init = trend_init.permute(0, 1, 3, 4, 2).reshape(B, -1, L)
+
+        x = seasonal_init + trend_init
+        x = self.fold(x) # [B, C_out * T_out, H, W]
+        x = x.reshape(B, self.T_out, self.C_out, H, W)
+        x = x.permute(0, 1, 3, 4, 2)
+        return x # [B, T, H, W, С_out]
